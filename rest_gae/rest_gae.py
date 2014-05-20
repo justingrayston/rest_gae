@@ -3,7 +3,7 @@ Wraps NDB models and provided REST APIs (GET/POST/PUT/DELETE) arounds them.  Ful
 
 Some code is taken from: https://github.com/abahgat/webapp2-user-accounts
 """
-
+import logging
 import importlib
 import json
 import re
@@ -27,6 +27,7 @@ try:
 except ImportError as e:
     dateutil = None
 
+from authentication import DefaultAuthentication
 
 # The REST permissions
 PERMISSION_ANYONE = 'anyone'
@@ -332,9 +333,11 @@ class BaseRESTHandler(webapp2.RequestHandler):
         return self.get_response(405, {})
 
     def permission_denied(self, reason=None):
+        logging.info('permission_denied')
         return self.get_response(403, { 'reason': reason})
 
     def unauthorized(self):
+        logging.info('unauthorized')
         return self.get_response(401, {})
 
     def redirect(self, url, **kwd):
@@ -562,7 +565,6 @@ class BaseRESTHandler(webapp2.RequestHandler):
 
 
 
-
 def get_rest_class(ndb_model, base_url, **kwd):
     """Returns a RESTHandlerClass with the ndb_model and permissions set according to input"""
 
@@ -574,8 +576,9 @@ def get_rest_class(ndb_model, base_url, **kwd):
             class NewRESTMeta: pass
             model.RESTMeta = NewRESTMeta
         model.RESTMeta.base_url = base_url
-
-        permissions = { 'OPTIONS': PERMISSION_ANYONE }
+        authenticator = kwd.get('authenticator', DefaultAuthentication)
+        permissions = authenticator.get_default_permission()
+        #permissions = { 'OPTIONS': PERMISSION_ANYONE }
         permissions.update(kwd.get('permissions', {}))
         allow_http_method_override = kwd.get('allow_http_method_override', True)
         allowed_origin = kwd.get('allowed_origin', None)
@@ -589,15 +592,21 @@ def get_rest_class(ndb_model, base_url, **kwd):
         before_delete_callback = [kwd.get('before_delete_callback', None)]
         after_delete_callback = [kwd.get('after_delete_callback', None)]
 
-        # Validate arguments (we do this at this stage in order to raise exceptions immediately rather than while the app is running)
-        if PERMISSION_OWNER_USER in permissions.values():
-            if not hasattr(model, 'RESTMeta') or not hasattr(model.RESTMeta, 'user_owner_property'):
-                raise ValueError('Must define a RESTMeta.user_owner_property for the model class %s if user-owner permission is used' % (model))
-            if not hasattr(model, model.RESTMeta.user_owner_property):
-                raise ValueError('The user_owner_property "%s" (defined in RESTMeta.user_owner_property) does not exist in the given model %s' % (model.RESTMeta.user_owner_property, model))
+        '''
+            START AUTHENTICATION HERE, SET CLASS?
+        '''
+        
+
+        # # Validate arguments (we do this at this stage in order to raise exceptions immediately rather than while the app is running)
+        # if PERMISSION_OWNER_USER in permissions.values():
+        #     if not hasattr(model, 'RESTMeta') or not hasattr(model.RESTMeta, 'user_owner_property'):
+        #         raise ValueError('Must define a RESTMeta.user_owner_property for the model class %s if user-owner permission is used' % (model))
+        #     if not hasattr(model, model.RESTMeta.user_owner_property):
+        #         raise ValueError('The user_owner_property "%s" (defined in RESTMeta.user_owner_property) does not exist in the given model %s' % (model.RESTMeta.user_owner_property, model))
 
         def __init__(self, request, response):
             self.initialize(request, response)
+            self.authenticator.validate_arguments(self.model, self.permissions)
             blobstore_handlers.BlobstoreUploadHandler.__init__(self, request, response)
             blobstore_handlers.BlobstoreDownloadHandler.__init__(self, request, response)
 
@@ -622,22 +631,28 @@ def get_rest_class(ndb_model, base_url, **kwd):
                 # Verify permissions
                 permission = self.permissions[method_name]
 
-                if (permission in [PERMISSION_LOGGED_IN_USER, PERMISSION_OWNER_USER, PERMISSION_ADMIN]) and (not self.user):
-                    # User not logged-in as required
-                    return self.unauthorized()
+                valid, handler_method = self.authenticator.verify_permission(permission, self)
+                if not valid and handler_method.__self__ == self:
+                    return handler_method()
 
-                elif permission == PERMISSION_ADMIN and not self.is_user_admin:
-                    # User is not an admin
-                    return self.permission_denied()
+                # if (permission in [PERMISSION_LOGGED_IN_USER, PERMISSION_OWNER_USER, PERMISSION_ADMIN]) and (not self.user):
+                #     # User not logged-in as required
+                #     return self.unauthorized()
+
+                # elif permission == PERMISSION_ADMIN and not self.is_user_admin:
+                #     # User is not an admin
+                #     return self.permission_denied()
 
                 try:
                     # Call original method
                     if model_id:
                         model = self._model_id_to_model(model_id.lstrip('/')) # Get rid of '/' at the beginning
 
-                        if (permission == PERMISSION_OWNER_USER) and (self.get_model_owner(model) != self.user.key):
-                            # The currently logged-in user is not the owner of the model
-                            return self.permission_denied()
+                        self.authenticator.user_has_access_to_model(permission, model, self)
+
+                        # if (permission == PERMISSION_OWNER_USER) and (self.get_model_owner(model) != self.user.key):
+                        #     # The currently logged-in user is not the owner of the model
+                        #     return self.permission_denied()
 
                         if property_name and model:
                             # Get the original name of the property
@@ -681,9 +696,10 @@ def get_rest_class(ndb_model, base_url, **kwd):
 
                 query = self._filter_query() # Filter the results
 
-                if self.permissions['GET'] == PERMISSION_OWNER_USER:
-                    # Return only models owned by currently logged-in user
-                    query = query.filter(getattr(self.model, self.user_owner_property) == self.user.key)
+                query = self.authenticator.filter_by_access("GET", self, query)
+                # if self.permissions['GET'] == PERMISSION_OWNER_USER:
+                #     # Return only models owned by currently logged-in user
+                #     query = query.filter(getattr(self.model, self.user_owner_property) == self.user.key)
 
                 query = self._order_query(query) # Order the results
                 (results, cursor) = self._fetch_query(query) # Fetch them (with a limit / specific page, if provided)
@@ -866,12 +882,14 @@ def get_rest_class(ndb_model, base_url, **kwd):
             else:
                 # Delete multiple model instances
 
-                if self.permissions['DELETE'] == PERMISSION_OWNER_USER:
-                    # Delete all models owned by the currently logged-in user
-                    query = self.model.query().filter(getattr(self.model, self.user_owner_property) == self.user.key)
-                else:
-                    # Delete all models
-                    query = self.model.query()
+                query = self.authenticator.filter_by_access('DELETE', self)
+
+                # if self.permissions['DELETE'] == PERMISSION_OWNER_USER:
+                #     # Delete all models owned by the currently logged-in user
+                #     query = self.model.query().filter(getattr(self.model, self.user_owner_property) == self.user.key)
+                # else:
+                #     # Delete all models
+                #     query = self.model.query()
 
                 # Delete the models (we might need to fetch several pages in case of many results)
                 cursor = None
