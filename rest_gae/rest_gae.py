@@ -311,7 +311,7 @@ class BaseRESTHandler(webapp2.RequestHandler):
         """Returns an HTTP status message with JSON-encoded content (and appropriate HTTP response headers)"""
 
         # Create the JSON-encoded response
-        response = webapp2.Response(json.dumps(content, cls=NDBEncoder))
+        response = webapp2.Response(json.dumps(content, cls=NDBEncoder, sort_keys=True))
 
         response.status = status
 
